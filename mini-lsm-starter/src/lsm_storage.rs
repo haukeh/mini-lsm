@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use bytes::Bytes;
+use nom::error::ParseError;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use crate::block::Block;
@@ -15,9 +16,10 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::merge_iterator::MergeIterator;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
-use crate::mem_table::MemTable;
+use crate::mem_table::{MemTable, MemTableIterator};
 use crate::mvcc::LsmMvccInner;
 use crate::table::SsTable;
 
@@ -278,8 +280,25 @@ impl LsmStorageInner {
     }
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        unimplemented!()
+    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        let value = {
+            let state = self.state.read();
+            state
+                .memtable
+                .get(key)
+                .or(self.find_in_frozen_memtables(key))
+        };
+
+        Ok(value.filter(|v| !v.is_empty()))
+    }
+
+    fn find_in_frozen_memtables(&self, key: &[u8]) -> Option<Bytes> {
+        self.state
+            .read()
+            .imm_memtables
+            .iter()
+            .filter_map(|tbl| tbl.get(key))
+            .next()
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -288,13 +307,27 @@ impl LsmStorageInner {
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let new_size = {
+            let state = self.state.read();
+            state.memtable.put(key, value)?;
+            state.memtable.approximate_size()
+        };
+
+        if new_size >= self.options.target_sst_size {
+            let lock = self.state_lock.lock();
+            // check again after lock
+            if new_size >= self.options.target_sst_size {
+                self.force_freeze_memtable(&lock)?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Remove a key from the storage by writing an empty value.
-    pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        self.put(key, &[])
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -319,7 +352,21 @@ impl LsmStorageInner {
 
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        unimplemented!()
+        let mut guard = self.state.write();
+        // get clone of raw LsmStorageState out of the Arc
+        let mut state_ref = guard.as_ref().clone();
+        // swap the memtable Arc inside this reference
+        let old_memtable = std::mem::replace(
+            &mut state_ref.memtable,
+            Arc::new(MemTable::create(self.next_sst_id())),
+        );
+        // move old memtable into the frozen memtable vector
+        state_ref.imm_memtables.insert(0, old_memtable);
+
+        // put modified reference back into an Arc
+        *guard = Arc::new(state_ref);
+
+        Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk
@@ -332,12 +379,37 @@ impl LsmStorageInner {
         Ok(())
     }
 
+    pub fn map_bound(bound: Bound<&[u8]>) -> Bound<Bytes> {
+        match bound {
+            Bound::Included(x) => Bound::Included(Bytes::copy_from_slice(x)),
+            Bound::Excluded(x) => Bound::Excluded(Bytes::copy_from_slice(x)),
+            Bound::Unbounded => Bound::Unbounded,
+        }
+    }
+
     /// Create an iterator over a range of keys.
     pub fn scan(
         &self,
-        _lower: Bound<&[u8]>,
-        _upper: Bound<&[u8]>,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        unimplemented!()
+        println!("Lower {:?} - Upper {:?}", lower, upper);
+
+        // let lock = self.state_lock.lock();
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        };
+
+        let current_memtable = std::iter::once(snapshot.memtable.clone());
+        let older_membtables = snapshot.imm_memtables.iter().cloned();
+
+        let memtable_iters: Vec<Box<MemTableIterator>> = current_memtable
+            .chain(older_membtables)
+            .map(|memtable| Box::new(memtable.scan(lower, upper)))
+            .collect();
+        let merge_iterator = MergeIterator::create(memtable_iters);
+        let iter = FusedIterator::new(LsmIterator::new(merge_iterator)?);
+        Ok(iter)
     }
 }
