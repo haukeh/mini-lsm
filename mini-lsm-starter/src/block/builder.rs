@@ -1,5 +1,7 @@
 use std::mem;
 
+use bytes::BufMut;
+
 use crate::key::{KeySlice, KeyVec};
 
 use super::{Block, SIZEOF_U16};
@@ -23,7 +25,7 @@ impl BlockBuilder {
         BlockBuilder {
             offsets: Vec::new(),
             data: Vec::new(),
-            block_size: block_size,
+            block_size,
             first_key: KeyVec::new(),
         }
     }
@@ -39,21 +41,20 @@ impl BlockBuilder {
     /// Adds a key-value pair to the block. Returns false when the block is full.
     #[must_use]
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> bool {
-        if !self.is_empty() && self.estimated_size(key, value) >= self.block_size {
+        if !self.is_empty() && self.estimated_size(key, value) > self.block_size {
             return false;
         }
 
-        let key_len = key.len() as u16;
-        let key_bytes = key.into_inner();
-        let value_len = value.len() as u16;
-        let value_bytes = value;
-
-        self.data.extend_from_slice(&key_len.to_ne_bytes()[..]);
-        self.data.extend_from_slice(key_bytes);
-        self.data.extend_from_slice(&value_len.to_ne_bytes()[..]);
-        self.data.extend_from_slice(value_bytes);
-
         self.offsets.push(self.data.len() as u16);
+
+        let key_len = key.len() as u16;
+        let key_bytes = key.raw_ref();
+        let value_len = value.len() as u16;
+
+        self.data.put_u16(key_len);
+        self.data.put(key_bytes);
+        self.data.put_u16(value_len);
+        self.data.extend_from_slice(value);
 
         if self.first_key.is_empty() {
             self.first_key = key.to_key_vec();
@@ -64,7 +65,7 @@ impl BlockBuilder {
 
     /// Check if there is no key-value pair in the block.
     pub fn is_empty(&self) -> bool {
-        self.data.len() == 0
+        self.offsets.is_empty()
     }
 
     /// Finalize the block.

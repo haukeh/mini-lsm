@@ -1,6 +1,3 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
@@ -23,14 +20,23 @@ pub struct BlockIterator {
     first_key: KeyVec,
 }
 
+impl Block {
+    fn get_first_key(&self) -> KeyVec {
+        let mut buf = &self.data[..];
+        let key_len = buf.get_u16();
+        let key = &buf[..key_len as usize];
+        KeyVec::from_vec(key.to_vec())
+    }
+}
+
 impl BlockIterator {
     fn new(block: Arc<Block>) -> Self {
         Self {
+            first_key: KeyVec::new(),
             block,
             key: KeyVec::new(),
             value_range: (0, 0),
             idx: 0,
-            first_key: KeyVec::new(),
         }
     }
 
@@ -71,18 +77,20 @@ impl BlockIterator {
     }
 
     fn seek_to_idx(&mut self, idx: usize) {
-        if idx > self.block.offsets.len() {
-            panic!("index out of bounds");
+        if idx >= self.block.offsets.len() {
+            self.key.clear();
+            self.value_range = (0, 0);
+            return;
         }
 
         let offset = self.block.offsets[idx] as usize;
         let mut entry = &self.block.data[offset..];
         let key_len = entry.get_u16() as usize;
-        self.first_key.clear();
-        self.first_key.append(&entry[..key_len]);
+        self.key.clear();
+        self.key.append(&entry[..key_len]);
         entry.advance(key_len);
         let value_len = entry.get_u16() as usize;
-        let value_offset_start = offset + SIZEOF_U16 + SIZEOF_U16 + key_len + SIZEOF_U16;
+        let value_offset_start = offset + SIZEOF_U16 + key_len + SIZEOF_U16;
         self.value_range = (value_offset_start, value_offset_start + value_len);
         entry.advance(value_len);
         self.idx = idx;
@@ -103,7 +111,7 @@ impl BlockIterator {
             let key_len = entry.get_u16() as usize;
             let k = &entry[..key_len];
             entry.advance(key_len);
-            let value_offset_start = start_offset + SIZEOF_U16 + SIZEOF_U16 + key_len + SIZEOF_U16;
+            let value_offset_start = start_offset + SIZEOF_U16 + key_len + SIZEOF_U16;
             match k.cmp(key.raw_ref()) {
                 std::cmp::Ordering::Less => {
                     let value_len = entry.get_u16() as usize;
@@ -112,12 +120,10 @@ impl BlockIterator {
                     continue;
                 }
                 std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => {
-                    self.first_key.clear();
-                    self.first_key.append(k);
+                    self.key.clear();
+                    self.key.append(k);
                     let value_len = entry.get_u16() as usize;
-                    entry.advance(value_len);
                     self.value_range = (value_offset_start, value_offset_start + value_len);
-                    self.idx += 1;
                     return;
                 }
             }

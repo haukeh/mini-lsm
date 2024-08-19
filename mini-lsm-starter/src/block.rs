@@ -23,10 +23,11 @@ impl Block {
     /// Note: You may want to recheck if any of the expected field is missing from your output
     pub fn encode(&self) -> Bytes {
         let mut buf = self.data.clone();
+        let offsets_len = self.offsets.len();
         for offset in &self.offsets {
             buf.put_u16(*offset);
         }
-        buf.put_u16(self.offsets.len() as u16);
+        buf.put_u16(offsets_len as u16);
         buf.into()
     }
 
